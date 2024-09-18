@@ -1,0 +1,36 @@
+# config.yml
+
+# Relay server configuration
+server:
+  host: '127.0.0.1'  # Use IPv4 address instead of 'localhost'
+  port: 8000
+
+# Relay client configuration
+client:
+  message: 'Hello, Relay!'
+
+# Relay lifetime configuration
+relay:
+  lifetime: 60  # Lifetime of each relay in seconds
+
+# TOR integration settings
+tor_enabled: true
+
+# Dynamic IP Manager settings
+dynamic_ip_enabled: true
+
+# API server configuration
+api:
+  host: '0.0.0.0'
+  port: 5000
+
+# Security settings
+security:
+  ssl_cert_path: 'certificates/server.crt'
+  ssl_key_path: 'certificates/server.key'
+  ca_cert_path: 'certificates/ca.crt'
+
+# Logging settings
+logging:
+  level: 'INFO'
+  log_file: 'monitoring/logs/relay.log'

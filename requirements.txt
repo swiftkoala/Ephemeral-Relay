@@ -1,0 +1,26 @@
+# Flask and related dependencies
+Flask==2.0.3
+Werkzeug==2.0.3
+
+# SSL and security
+cryptography==38.0.1
+pyOpenSSL==22.0.0
+
+# Networking and socket communication
+PySocks==1.7.1
+socksio==1.0.0
+requests[socks]==2.27.1
+
+# Asynchronous programming
+asyncio==3.4.3
+
+# TOR integration
+torpy==1.1.6
+
+# APIs and JSON handling
+flask-cors==3.0.10
+
+# Testing (if you have tests that use these)
+pytest==7.1.2
+pytest-asyncio==0.17.1
+pytest-flask==1.2.0

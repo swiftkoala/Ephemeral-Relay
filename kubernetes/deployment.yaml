@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ephemeral-relay
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ephemeral-relay
+  template:
+    metadata:
+      labels:
+        app: ephemeral-relay
+    spec:
+      containers:
+      - name: relay-server
+        image: ephemeral-relay:latest
+        ports:
+        - containerPort: 5000
