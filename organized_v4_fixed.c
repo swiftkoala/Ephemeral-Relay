@@ -7,29 +7,72 @@
 #include <netioapi.h>    // Network I/O APIs
 #include <wdm.h>         // Windows Driver Model
 #include <ntstrsafe.h>   // Safe string functions
-#include <ndis.h>      // NDIS (Network Driver Interface Specification)
-#include <ntddndis.h>  // NDIS I/O control codes
-#include <tcpip.h>     // TCP/IP specific structures (for things like TCP_HEADER, UDP_HEADER)
-#include <netiodef.h>  // Network IO Definitions
+#include <ndis.h>        // NDIS (Network Driver Interface Specification)
+#include <ntddndis.h>    // NDIS I/O control codes
+#include <tcpip.h>       // TCP/IP specific structures (for things like TCP_HEADER, UDP_HEADER)
+#include <netiodef.h>    // Network IO Definitions
 
-// Define the base device type for network-related operations
+/// Device and Protocol Constants
 #define FILE_DEVICE_NETWORK 0x12
+#define PROTOCOL_ICMP 1
 
-// Define IOCTLs for logging connections
+// Packet Processing Error Codes
+#define PACKET_PROCESSING_SUCCESS 0
+#define PACKET_PROCESSING_ERROR -1
+#define PACKET_INVALID_PROTOCOL -2
+#define PACKET_MALFORMED -3
 
-// IOCTL Definitions and Setup
+// Packet Inspection Result Codes
+#define PACKET_INSPECTION_SUCCESS 0
+#define PACKET_INSPECTION_FAILURE -1
+#define PACKET_DETECTED_MALICIOUS -2
+
+// IOCTL Definitions for Logging
 #define IOCTL_LOG_CONNECTIONS CTL_CODE(FILE_DEVICE_NETWORK, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_LOG_FAULT_TOLERANCE CTL_CODE(FILE_DEVICE_NETWORK, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_LOG_FILTER_RULES CTL_CODE(FILE_DEVICE_NETWORK, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_LOG_MEMORY_STATS CTL_CODE(FILE_DEVICE_NETWORK, 0x903, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_LOG_STATS CTL_CODE(FILE_DEVICE_NETWORK, 0x904, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// Define IOCTLs for resetting stats and memory
+// IOCTL Definitions for Resetting Stats
 #define IOCTL_RESET_MEMORY_STATS CTL_CODE(FILE_DEVICE_NETWORK, 0x905, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RESET_STATS CTL_CODE(FILE_DEVICE_NETWORK, 0x906, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// Define IOCTL for setting the log level
+// IOCTL Definition for Setting Log Level
 #define IOCTL_SET_LOG_LEVEL CTL_CODE(FILE_DEVICE_NETWORK, 0x907, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// IOCTL Definitions for Filter Rule Management
+#define IOCTL_ADD_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_REMOVE_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MODIFY_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_LIST_FILTER_RULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Optimization and Traffic Control Constants
+#define MAX_BATCH_SIZE 32
+#define MAX_CONNECTIONS_PER_MINUTE 100
+
+// Packet Validation Limits
+#define MAX_PORT_NUMBER 65535
+#define MIN_PACKET_SIZE 64
+#define MAX_PACKET_SIZE 65535
+
+// Security Event IDs for Logging
+#define SECURITY_EVENT_PACKET_DROPPED 1001
+#define SECURITY_EVENT_ENCRYPTION_FAILURE 1002
+#define SECURITY_EVENT_CHECKSUM_FAILURE 1003
+
+// Security Constants
+#define ENCRYPTION_KEY_LENGTH 16
+#define DECRYPTION_FAILURE -4
+#define STRIP_SENSITIVE_DATA 1
+#define MASKED_IDENTIFIER 0xFFFF
+
+// Logging Levels
+#define LOG_SECURITY 3
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////end of define code////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // You can add more IOCTL definitions here if needed
 // Add other IOCTL definitions as needed.
@@ -620,7 +663,7 @@ static VOID ApplyFilteringRules(PNET_BUFFER_LIST nbl) {
             DbgPrint("Failed to query MDL for packet filtering\n");
             continue;
         }
-
+        
         // Iterate through the list of filter rules
         while (currentRule) {
             if (currentRule->isActive) {
@@ -754,12 +797,56 @@ static             FreeMemory(current);
     return STATUS_NOT_FOUND;
 }
 
-//Update an existing Connection state, sequence number, and acknowledgment number
+// Update an existing Connection state, sequence number, and acknowledgment number with enhanced checks
 static NTSTATUS UpdateConnection(TCP_CONNECTION* connection, UINT32 seqNum, UINT32 ackNum, TCP_STATE newState) {
+    
+    // Check if seqNum and ackNum are within valid ranges
+    if (seqNum < connection->seqNum || ackNum < connection->ackNum) {
+        DbgPrint("Invalid sequence or acknowledgment number. Seq: %u, Ack: %u\n", seqNum, ackNum);
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Ensure valid TCP state transitions (following TCP FSM)
+    switch (connection->state) {
+        case TCP_STATE_LISTEN:
+            if (newState != TCP_STATE_SYN_RECEIVED && newState != TCP_STATE_SYN_SENT) {
+                DbgPrint("Invalid state transition from LISTEN to %d\n", newState);
+                return STATUS_INVALID_PARAMETER;
+            }
+            break;
+        case TCP_STATE_SYN_SENT:
+            if (newState != TCP_STATE_ESTABLISHED && newState != TCP_STATE_SYN_RECEIVED) {
+                DbgPrint("Invalid state transition from SYN_SENT to %d\n", newState);
+                return STATUS_INVALID_PARAMETER;
+            }
+            break;
+        case TCP_STATE_ESTABLISHED:
+            if (newState != TCP_STATE_FIN_WAIT_1 && newState != TCP_STATE_CLOSE_WAIT) {
+                DbgPrint("Invalid state transition from ESTABLISHED to %d\n", newState);
+                return STATUS_INVALID_PARAMETER;
+            }
+            break;
+        // Add additional cases for other TCP states
+        default:
+            break;
+    }
+    
+    // Implement timeout handling if the connection is idle for too long
+    if (connection->lastActivityTime + TCP_TIMEOUT < GetCurrentSystemTime()) {
+        DbgPrint("Connection timeout. Closing connection.\n");
+        connection->state = TCP_STATE_CLOSED;
+        return STATUS_CONNECTION_RESET;
+    }
+
+    // Update the connection details
     connection->seqNum = seqNum;
     connection->ackNum = ackNum;
     connection->state = newState;
-    DbgPrint("Connection state updated: Src IP: %x, Src Port: %d, State: %d\n", connection->srcIP, connection->srcPort, connection->state);
+    connection->lastActivityTime = GetCurrentSystemTime(); // Update the timestamp for activity tracking
+
+    DbgPrint("Connection state updated: Src IP: %x, Src Port: %d, State: %d, Seq: %u, Ack: %u\n", 
+             connection->srcIP, connection->srcPort, connection->state, connection->seqNum, connection->ackNum);
+
     return STATUS_SUCCESS;
 }
 
@@ -854,11 +941,6 @@ static         FreeMemory(currentConn);
     DbgPrint("Driver unloaded: All connections and filter rules cleaned up.\n");
 }
 // Begin Part 5: Connection Timeout Handling and State Management
-
-
-// Includes and Preprocessor Directives
-#include <wdm.h>
-#include <ntddk.h>
 
 // TCP Connection timeout threshold (e.g., 2 minutes)
 #define CONNECTION_TIMEOUT_THRESHOLD 120
@@ -1014,11 +1096,6 @@ static VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
     DbgPrint("Driver unloaded: All resources cleaned up.\n");
 }
-
-// End of Part 5: Connection Timeout Handling and State Management
-
-// Packet Processing Logic
-// Begin Part 6: Packet Filtering and Checksum Validation
 
 // Forward declaration for checksum validation function
 
@@ -1691,7 +1768,7 @@ static     SecureHandleOutgoingPackets(NetBufferLists);
 
 // Function to securely handle IOCTL commands for AES key management (mock implementation)
 static NTSTATUS HandleSecureIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    PIO_STACK_LO CATION stack = IoGetCurrentIrpStackLocation(Irp);
     ULONG controlCode = stack->Parameters.DeviceIoControl.IoControlCode;
 
     switch (controlCode) {
@@ -1930,8 +2007,10 @@ static     TerminatePacketProcessingThreads();
     DbgPrint("Multithreading resources cleaned up.\n");
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////// Driver Entry Point and Unload///////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Driver Entry Point and Unload
 // Modified DriverEntry to include multithreading initialization
 
 // Multithreading and Concurrency Functions
@@ -2319,16 +2398,6 @@ static     ProcessDeferredFreeList();
 }
 // Continuation from Part 13...
 
-// Define additional protocol constants
-#define PROTOCOL_ICMP 1
-
-// Error codes for packet processing
-#define PACKET_PROCESSING_SUCCESS 0
-#define PACKET_PROCESSING_ERROR -1
-#define PACKET_INVALID_PROTOCOL -2
-#define PACKET_MALFORMED -3
-
-
 // Packet Processing Logic
 // Enhanced Function to Process and Inspect Packets
 static NTSTATUS ProcessPacket(PNET_BUFFER_LIST nbl, ULONG SendFlags) {
@@ -2497,10 +2566,6 @@ static VOID LogPacketProcessingDetails(PUCHAR buffer, USHORT protocol, ULONG dat
 }
 // Continuation from Part 14...
 
-// Define constants for security
-#define ENCRYPTION_KEY_LENGTH 16
-#define DECRYPTION_FAILURE -4
-
 // Sample encryption key (for demonstration purposes)
 UCHAR encryptionKey[ENCRYPTION_KEY_LENGTH] = { 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
 
@@ -2612,10 +2677,6 @@ static VOID LogSecurityEvent(ULONG eventId, const char* message) {
     DbgPrint("[%lld] Security Event ID %lu: %s\n", timestamp.QuadPart, eventId, message);
 }
 
-// Define security event IDs for logging
-#define SECURITY_EVENT_PACKET_DROPPED 1001
-#define SECURITY_EVENT_ENCRYPTION_FAILURE 1002
-#define SECURITY_EVENT_CHECKSUM_FAILURE 1003
 
 static // Example usage of LogSecurityEvent within a packet handling routine
 
@@ -2632,11 +2693,7 @@ static             LogSecurityEvent(SECURITY_EVENT_ENCRYPTION_FAILURE, "Packet d
         }
     }
 }
-// Continuation from Part 15...
 
-// Define constants for data stripping
-#define STRIP_SENSITIVE_DATA 1
-#define MASKED_IDENTIFIER 0xFFFF
 
 // Function to strip sensitive data from packets
 static VOID StripSensitiveData(PUCHAR buffer, ULONG ipHeaderLength, USHORT protocol) {
@@ -2715,6 +2772,7 @@ static VOID EnhancedFilterSendHandler(
 
 
 // Logging and Debugging Functions
+
 // Logging function to track packet stripping actions
 static VOID LogStrippingAction(PUCHAR buffer, ULONG dataLength) {
     LARGE_INTEGER timestamp;
@@ -2896,13 +2954,7 @@ static BOOLEAN IsMaliciousTraffic(PUCHAR buffer, ULONG dataLength) {
     }
     return FALSE;
 }
-// Define custom IOCTL codes for rule management
 
-// IOCTL Definitions and Setup
-#define IOCTL_ADD_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_REMOVE_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_MODIFY_FILTER_RULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_LIST_FILTER_RULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Structure for passing filter rules between user-space and kernel-space
 typedef struct _USER_FILTER_RULE {
@@ -3083,13 +3135,7 @@ static NTSTATUS DriverEntryRuleManager(PDRIVER_OBJECT DriverObject, PUNICODE_STR
     DbgPrint("Dynamic rule management system loaded successfully.\n");
     return STATUS_SUCCESS;
 }
-// Define a logging level for security-related events
-#define LOG_SECURITY 3
 
-// Define a set of validation limits for the user-space rules
-#define MAX_PORT_NUMBER 65535
-#define MIN_PACKET_SIZE 64
-#define MAX_PACKET_SIZE 65535
 
 // Function prototypes for new security and validation checks
 NTSTATUS ValidateUserFilterRule(PUSER_FILTER_RULE userRule);
@@ -3439,18 +3485,6 @@ static VOID LogUnmatchedPacket(PUCHAR buffer, ULONG ipHeaderLength, USHORT proto
 
 // NEW DPI code here //
 // Include required headers
-
-// Includes and Preprocessor Directives
-#include <ntddk.h>
-#include <fwpsk.h>
-#include <netioapi.h>
-#include <wdm.h>
-#include <ntstrsafe.h>
-
-// Define packet inspection result codes
-#define PACKET_INSPECTION_SUCCESS 0
-#define PACKET_INSPECTION_FAILURE -1
-#define PACKET_DETECTED_MALICIOUS -2
 
 // Function prototypes for deep packet inspection and rule application
 
@@ -4031,8 +4065,6 @@ static         LogSecurityEvent("Filter rules successfully listed", NULL);
     }
     return status;
 }
-// Define threshold values for suspicious traffic detection
-#define MAX_CONNECTIONS_PER_MINUTE 100
 
 // Structure to track IP connection activity
 typedef struct _IP_ACTIVITY_TRACKER {
@@ -4789,9 +4821,6 @@ static VOID InitializeRelayMetadata() {
 ///////////////////// enhancements or future code implimentations ////////////
 /////////////////////////////////////////////////////////////////////////////
 
-// Includes and Preprocessor Directives
-#include <ndis.h>  // Include the NDIS library for offloading support
-
 // Structure to hold offloading information
 typedef struct _OFFLOAD_INFO {
     BOOLEAN checksumOffloadEnabled;
@@ -4931,8 +4960,7 @@ NTSTATUS InsertRuleToHashTable(PFILTER_RULE rule) {
 
 
 // Packet Processing Logic
-// Optimization 3: Packet batching
-#define MAX_BATCH_SIZE 32
+
 PNET_BUFFER_LIST packetBatch[MAX_BATCH_SIZE];
 ULONG currentBatchSize = 0;
 
